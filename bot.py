@@ -1,0 +1,159 @@
+# bot.py
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+import pandas as pd
+
+from config import (
+    SYMBOL,
+    CHECK_INTERVAL_SECONDS,
+    DEFAULT_STOP_LOSS_PCT,
+    TF_MAIN,
+    TF_MID,
+    TF_HIGH,
+)
+from exchange import init_client
+from risk import init_risk_state, maybe_reset_day, can_open_new_trade, compute_position_size
+from strategy import evaluate_strategy
+from indicators import ema, rsi, macd
+from telegram_bot import send_telegram_message
+
+
+def get_mark_price(client) -> float:
+    # use ticker price as proxy for mark
+    data = client._request("GET", "/fapi/v1/ticker/price", signed=False, params={"symbol": SYMBOL})
+    return float(data["price"])
+
+
+def get_wallet_equity_and_balance(client):
+    acct = client.get_account()
+    # Account structure: list of assets with balances etc.
+    equity = float(acct["totalWalletBalance"])
+    wallet_balance = 0.0
+    for a in acct["assets"]:
+        if a["asset"] == "USDT":
+            wallet_balance = float(a["walletBalance"])
+            break
+    return equity, wallet_balance
+
+
+def get_open_position_info(client):
+    positions = client.get_positions()
+    for p in positions:
+        if p["symbol"] == SYMBOL and float(p["positionAmt"]) != 0:
+            qty = float(p["positionAmt"])
+            entry_price = float(p["entryPrice"])
+            side = "BUY" if qty > 0 else "SELL"
+            return {
+                "qty": abs(qty),
+                "entry_price": entry_price,
+                "side": side,
+            }
+    return None
+
+
+def compute_stop_price(entry_price: float, side: str) -> float:
+    if side == "BUY":
+        return entry_price * (1 - DEFAULT_STOP_LOSS_PCT)
+    else:
+        return entry_price * (1 + DEFAULT_STOP_LOSS_PCT)
+
+
+def should_exit_by_indicators(client, tf="5m") -> bool:
+    # Quick check using latest 5m candles:
+    klines = client.get_klines(SYMBOL, tf, limit=60)
+    df = pd.DataFrame(
+        klines,
+        columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "qav", "num_trades", "tbbav", "tbqav", "ignore",
+        ],
+    ).iloc[:-1]  # drop open candle
+    df["close"] = df["close"].astype(float)
+
+    df["ema50"] = ema(df["close"], 50)
+    df["rsi"] = rsi(df["close"], 14)
+    macd_line, signal_line, hist = macd(df["close"])
+    df["macd_hist"] = hist
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    # Risk-averse exit conditions, we interpret symmetrical for long/short in main loop
+    return (prev["macd_hist"] > 0 >= last["macd_hist"]) or (prev["macd_hist"] < 0 <= last["macd_hist"])
+
+
+def main():
+    client = init_client()
+    equity, wallet_balance = get_wallet_equity_and_balance(client)
+    risk_state = init_risk_state(equity)
+
+    send_telegram_message(f"ETH Futures bot started on {datetime.now(timezone.utc)} (env active).")
+
+    while True:
+        loop_start = time.time()
+        try:
+            # --- Update account & risk ---
+            equity, wallet_balance = get_wallet_equity_and_balance(client)
+            risk_state = maybe_reset_day(risk_state, equity)
+            allowed = can_open_new_trade(risk_state, equity)
+
+            pos_info: Optional[dict] = get_open_position_info(client)
+            mark_price = get_mark_price(client)
+
+            # --- Manage open position (check exits) ---
+            if pos_info:
+                side = pos_info["side"]
+                entry_price = pos_info["entry_price"]
+                qty = pos_info["qty"]
+
+                stop_price = compute_stop_price(entry_price, side)
+                # Hard stop
+                if side == "BUY" and mark_price <= stop_price:
+                    client.create_market_order(SYMBOL, "SELL", qty, reduce_only=True)
+                    send_telegram_message(
+                        f"Stop-loss hit on long {SYMBOL}: entry={entry_price}, stop={stop_price}, mark={mark_price}"
+                    )
+                elif side == "SELL" and mark_price >= stop_price:
+                    client.create_market_order(SYMBOL, "BUY", qty, reduce_only=True)
+                    send_telegram_message(
+                        f"Stop-loss hit on short {SYMBOL}: entry={entry_price}, stop={stop_price}, mark={mark_price}"
+                    )
+                else:
+                    # Indicator-based exit (trend shift)
+                    if should_exit_by_indicators(client):
+                        exit_side = "SELL" if side == "BUY" else "BUY"
+                        client.create_market_order(SYMBOL, exit_side, qty, reduce_only=True)
+                        send_telegram_message(f"Indicator exit on {side} {SYMBOL} at mark {mark_price}")
+            else:
+                # --- No open position: maybe open a new one ---
+                if allowed:
+                    kl_5 = client.get_klines(SYMBOL, TF_MAIN, limit=200)
+                    kl_15 = client.get_klines(SYMBOL, TF_MID, limit=200)
+                    kl_1h = client.get_klines(SYMBOL, TF_HIGH, limit=200)
+                    order_book = client.get_order_book(SYMBOL, limit=20)
+
+                    signal = evaluate_strategy(kl_5, kl_15, kl_1h, order_book)
+                    if signal:
+                        qty = compute_position_size(wallet_balance, mark_price)
+                        if qty > 0:
+                            resp = client.create_market_order(SYMBOL, signal.side, qty)
+                            send_telegram_message(
+                                f"Opened {signal.side} {SYMBOL}, qty={qty}, price≈{mark_price}, reason={signal.reason}"
+                            )
+                else:
+                    print("[INFO] Daily drawdown limit hit, not opening new positions today.")
+
+        except Exception as e:
+            print(f"[ERROR] {e}")
+            send_telegram_message(f"[ERROR] {e}")
+
+        # Sleep to roughly hit every 5 minutes
+        elapsed = time.time() - loop_start
+        sleep_for = max(5, CHECK_INTERVAL_SECONDS - elapsed)
+        time.sleep(sleep_for)
+
+
+if __name__ == "__main__":
+    main()
