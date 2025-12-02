@@ -68,13 +68,9 @@ POSITION_SIZE_PCT = float(os.getenv("POSITION_SIZE_PCT", 0.10))  # 0.10 = 10%
 # this % from day's start (daily drawdown)
 MAX_DAILY_DRAWDOWN_PCT = float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", 0.10))  # 10%
 
-# Extra safety: maximum allowed notional relative to equity (e.g. 5x)
-# If equity is 5,000 USDT and this is 5.0 => max notional ≈ 25,000 USDT
-MAX_NOTIONAL_MULTIPLIER = float(os.getenv("MAX_NOTIONAL_MULTIPLIER", 5.0))
-
-# Kept for backwards compatibility with any old code that might reference it.
-# The new bot uses ATR-based SL/TP instead of this.
-DEFAULT_STOP_LOSS_PCT = float(os.getenv("DEFAULT_STOP_LOSS_PCT", 0.10))
+# Backwards-compatibility aliases for risk.py
+TRADE_BALANCE_FRACTION = POSITION_SIZE_PCT
+DAILY_DRAWDOWN_LIMIT = MAX_DAILY_DRAWDOWN_PCT
 
 # ===========================
 #  Indicator Parameters
