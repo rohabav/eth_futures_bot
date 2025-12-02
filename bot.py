@@ -27,14 +27,26 @@ def get_mark_price(client) -> float:
 
 
 def get_wallet_equity_and_balance(client):
+    """
+    Reads futures account info and extracts:
+      - totalWalletBalance as 'equity'
+      - USDT walletBalance as 'wallet_balance'
+    """
+    print("[DEBUG] Fetching account info...")
     acct = client.get_account()
-    # Account structure: list of assets with balances etc.
-    equity = float(acct["totalWalletBalance"])
+    print(f"[DEBUG] Raw account response: {acct}")
+    # May look slightly different on demo vs real, so we log it
+
+    # equity (total wallet balance across assets)
+    equity = float(acct.get("totalWalletBalance", 0.0))
+
     wallet_balance = 0.0
-    for a in acct["assets"]:
-        if a["asset"] == "USDT":
-            wallet_balance = float(a["walletBalance"])
+    for a in acct.get("assets", []):
+        if a.get("asset") == "USDT":
+            wallet_balance = float(a.get("walletBalance", 0.0))
             break
+
+    print(f"[DEBUG] Parsed equity={equity}, wallet_balance={wallet_balance}")
     return equity, wallet_balance
 
 
@@ -85,11 +97,17 @@ def should_exit_by_indicators(client, tf="5m") -> bool:
 
 
 def main():
+    print("[INFO] Initializing Binance client...")
     client = init_client()
+    print("[INFO] Client initialized, fetching initial equity/balance...")
+
     equity, wallet_balance = get_wallet_equity_and_balance(client)
+    print(f"[INFO] Initial equity={equity}, wallet_balance={wallet_balance}")
+
     risk_state = init_risk_state(equity)
 
     send_telegram_message(f"ETH Futures bot started on {datetime.now(timezone.utc)} (env active).")
+    print("[INFO] Entering main loop...")
 
     while True:
         loop_start = time.time()
@@ -146,7 +164,9 @@ def main():
                     print("[INFO] Daily drawdown limit hit, not opening new positions today.")
 
         except Exception as e:
-            print(f"[ERROR] {e}")
+            import traceback
+            print("[ERROR] Exception inside main loop:")
+            traceback.print_exc()
             send_telegram_message(f"[ERROR] {e}")
 
         # Sleep to roughly hit every 5 minutes
@@ -156,4 +176,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Top-level guard so startup errors are visible in Railway logs
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print("[FATAL] Unhandled exception in bot startup:")
+        traceback.print_exc()
+        try:
+            send_telegram_message(f"[FATAL] Bot crashed on startup: {e}")
+        except Exception:
+            pass
