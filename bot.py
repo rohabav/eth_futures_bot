@@ -21,7 +21,9 @@ from telegram_bot import send_telegram_message
 
 
 def get_mark_price(client) -> float:
-    # use ticker price as proxy for mark
+    """
+    Use ticker price as a proxy for mark price.
+    """
     data = client._request("GET", "/fapi/v1/ticker/price", signed=False, params={"symbol": SYMBOL})
     return float(data["price"])
 
@@ -31,26 +33,53 @@ def get_wallet_equity_and_balance(client):
     Reads futures account info and extracts:
       - totalWalletBalance as 'equity'
       - USDT walletBalance as 'wallet_balance'
-    """
-    print("[DEBUG] Fetching account info...")
-    acct = client.get_account()
-    print(f"[DEBUG] Raw account response: {acct}")
-    # May look slightly different on demo vs real, so we log it
 
-    # equity (total wallet balance across assets)
+    Logs only a compact summary:
+      - equity
+      - USDT asset
+      - ETHUSDT position (if any)
+    """
+    acct = client.get_account()
+
+    # Total wallet equity (all assets converted to USDT)
     equity = float(acct.get("totalWalletBalance", 0.0))
 
+    # Find USDT asset only
     wallet_balance = 0.0
+    usdt_asset = None
     for a in acct.get("assets", []):
         if a.get("asset") == "USDT":
             wallet_balance = float(a.get("walletBalance", 0.0))
+            usdt_asset = a
             break
 
-    print(f"[DEBUG] Parsed equity={equity}, wallet_balance={wallet_balance}")
+    # Optional: find ETHUSDT position only
+    eth_pos = None
+    for p in acct.get("positions", []):
+        if p.get("symbol") == "ETHUSDT":
+            eth_pos = p
+            break
+
+    # Nice, compact debug log
+    print("[DEBUG] Account summary:")
+    print(f"  equity (totalWalletBalance) = {equity}")
+    if usdt_asset:
+        print(f"  USDT walletBalance         = {wallet_balance}")
+    if eth_pos:
+        print(
+            "  ETHUSDT position: "
+            f"amt={eth_pos.get('positionAmt')}, "
+            f"entry={eth_pos.get('entryPrice')}, "
+            f"unrealized={eth_pos.get('unrealizedProfit')}"
+        )
+
     return equity, wallet_balance
 
 
 def get_open_position_info(client):
+    """
+    Returns info about open ETHUSDT position, or None if flat.
+    """
     positions = client.get_positions()
     for p in positions:
         if p["symbol"] == SYMBOL and float(p["positionAmt"]) != 0:
@@ -66,14 +95,20 @@ def get_open_position_info(client):
 
 
 def compute_stop_price(entry_price: float, side: str) -> float:
+    """
+    Compute fixed-percentage stop price from entry.
+    """
     if side == "BUY":
         return entry_price * (1 - DEFAULT_STOP_LOSS_PCT)
     else:
         return entry_price * (1 + DEFAULT_STOP_LOSS_PCT)
 
 
-def should_exit_by_indicators(client, tf="5m") -> bool:
-    # Quick check using latest 5m candles:
+def should_exit_by_indicators(client, tf: str = "5m") -> bool:
+    """
+    Quick indicator-based exit check using latest 5m candles:
+      - MACD histogram cross through zero (trend shift).
+    """
     klines = client.get_klines(SYMBOL, tf, limit=60)
     df = pd.DataFrame(
         klines,
@@ -127,23 +162,28 @@ def main():
                 qty = pos_info["qty"]
 
                 stop_price = compute_stop_price(entry_price, side)
-                # Hard stop
+
+                # Hard stop-loss
                 if side == "BUY" and mark_price <= stop_price:
                     client.create_market_order(SYMBOL, "SELL", qty, reduce_only=True)
                     send_telegram_message(
                         f"Stop-loss hit on long {SYMBOL}: entry={entry_price}, stop={stop_price}, mark={mark_price}"
                     )
+                    print(f"[INFO] SL hit on long {SYMBOL} at {mark_price}")
                 elif side == "SELL" and mark_price >= stop_price:
                     client.create_market_order(SYMBOL, "BUY", qty, reduce_only=True)
                     send_telegram_message(
                         f"Stop-loss hit on short {SYMBOL}: entry={entry_price}, stop={stop_price}, mark={mark_price}"
                     )
+                    print(f"[INFO] SL hit on short {SYMBOL} at {mark_price}")
                 else:
                     # Indicator-based exit (trend shift)
                     if should_exit_by_indicators(client):
                         exit_side = "SELL" if side == "BUY" else "BUY"
                         client.create_market_order(SYMBOL, exit_side, qty, reduce_only=True)
                         send_telegram_message(f"Indicator exit on {side} {SYMBOL} at mark {mark_price}")
+                        print(f"[INFO] Indicator-based exit on {side} {SYMBOL} at {mark_price}")
+
             else:
                 # --- No open position: maybe open a new one ---
                 if allowed:
@@ -160,6 +200,16 @@ def main():
                             send_telegram_message(
                                 f"Opened {signal.side} {SYMBOL}, qty={qty}, price≈{mark_price}, reason={signal.reason}"
                             )
+                            print(
+                                f"[INFO] Opened {signal.side} {SYMBOL}, qty={qty}, price≈{mark_price}, "
+                                f"reason={signal.reason}"
+                            )
+                    else:
+                        # No trade this loop, log a compact heartbeat
+                        print(
+                            f"[INFO] No signal this loop. "
+                            f"equity={equity}, wallet={wallet_balance}, price={mark_price}"
+                        )
                 else:
                     print("[INFO] Daily drawdown limit hit, not opening new positions today.")
 
