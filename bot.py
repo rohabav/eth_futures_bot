@@ -8,22 +8,22 @@ import pandas as pd
 from config import (
     SYMBOL,
     CHECK_INTERVAL_SECONDS,
-    DEFAULT_STOP_LOSS_PCT,
     TF_MAIN,
     TF_MID,
     TF_HIGH,
+    ATR_PERIOD,
+    ATR_SL_MULTIPLIER,
+    ATR_TP_MULTIPLIER,
 )
 from exchange import init_client
 from risk import init_risk_state, maybe_reset_day, can_open_new_trade, compute_position_size
 from strategy import evaluate_strategy
-from indicators import ema, rsi, macd
+from indicators import atr
 from telegram_bot import send_telegram_message
 
 
 def get_mark_price(client) -> float:
-    """
-    Use ticker price as a proxy for mark price.
-    """
+    """Use ticker price as a proxy for mark price."""
     data = client._request("GET", "/fapi/v1/ticker/price", signed=False, params={"symbol": SYMBOL})
     return float(data["price"])
 
@@ -34,7 +34,7 @@ def get_wallet_equity_and_balance(client):
       - totalWalletBalance as 'equity'
       - USDT walletBalance as 'wallet_balance'
 
-    Logs only a compact summary:
+    Logs a compact summary:
       - equity
       - USDT asset
       - ETHUSDT position (if any)
@@ -56,11 +56,10 @@ def get_wallet_equity_and_balance(client):
     # Optional: find ETHUSDT position only
     eth_pos = None
     for p in acct.get("positions", []):
-        if p.get("symbol") == "ETHUSDT":
+        if p.get("symbol") == SYMBOL:
             eth_pos = p
             break
 
-    # Nice, compact debug log
     print("[DEBUG] Account summary:")
     print(f"  equity (totalWalletBalance) = {equity}")
     if usdt_asset:
@@ -94,41 +93,27 @@ def get_open_position_info(client):
     return None
 
 
-def compute_stop_price(entry_price: float, side: str) -> float:
+def _klines_to_df(klines) -> pd.DataFrame:
+    cols = [
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_asset_volume", "number_of_trades",
+        "taker_buy_base", "taker_buy_quote", "ignore",
+    ]
+    df = pd.DataFrame(klines, columns=cols)
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+    return df
+
+
+def compute_atr_from_15m(klines_15m) -> Optional[float]:
     """
-    Compute fixed-percentage stop price from entry.
+    Compute last ATR value from 15m klines.
     """
-    if side == "BUY":
-        return entry_price * (1 - DEFAULT_STOP_LOSS_PCT)
-    else:
-        return entry_price * (1 + DEFAULT_STOP_LOSS_PCT)
-
-
-def should_exit_by_indicators(client, tf: str = "5m") -> bool:
-    """
-    Quick indicator-based exit check using latest 5m candles:
-      - MACD histogram cross through zero (trend shift).
-    """
-    klines = client.get_klines(SYMBOL, tf, limit=60)
-    df = pd.DataFrame(
-        klines,
-        columns=[
-            "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "qav", "num_trades", "tbbav", "tbqav", "ignore",
-        ],
-    ).iloc[:-1]  # drop open candle
-    df["close"] = df["close"].astype(float)
-
-    df["ema50"] = ema(df["close"], 50)
-    df["rsi"] = rsi(df["close"], 14)
-    macd_line, signal_line, hist = macd(df["close"])
-    df["macd_hist"] = hist
-
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    # Risk-averse exit conditions, we interpret symmetrical for long/short in main loop
-    return (prev["macd_hist"] > 0 >= last["macd_hist"]) or (prev["macd_hist"] < 0 <= last["macd_hist"])
+    df15 = _klines_to_df(klines_15m)
+    if len(df15) < ATR_PERIOD + 2:
+        return None
+    atr_series = atr(df15)
+    return float(atr_series.iloc[-1])
 
 
 def compute_pnl(entry_price: float, exit_price: float, qty: float, side: str):
@@ -174,95 +159,141 @@ def main():
             pos_info: Optional[dict] = get_open_position_info(client)
             mark_price = get_mark_price(client)
 
-            # --- Manage open position (check exits) ---
-            if pos_info:
+            # --- Fetch candles for all timeframes (used for both entry & ATR exits) ---
+            kl_15 = client.get_klines(SYMBOL, TF_MAIN, limit=200)   # 15m
+            kl_30 = client.get_klines(SYMBOL, TF_MID, limit=200)    # 30m
+            kl_1h = client.get_klines(SYMBOL, TF_HIGH, limit=200)   # 1h
+
+            atr_15 = compute_atr_from_15m(kl_15)
+
+            # --- Position management: ATR-based SL & TP ---
+            if pos_info and atr_15 is not None:
                 side = pos_info["side"]
                 entry_price = pos_info["entry_price"]
                 qty = pos_info["qty"]
 
-                stop_price = compute_stop_price(entry_price, side)
+                if side == "BUY":
+                    sl = entry_price - ATR_SL_MULTIPLIER * atr_15
+                    tp = entry_price + ATR_TP_MULTIPLIER * atr_15
+                else:  # SHORT
+                    sl = entry_price + ATR_SL_MULTIPLIER * atr_15
+                    tp = entry_price - ATR_TP_MULTIPLIER * atr_15
 
-                # Hard stop-loss
-                if side == "BUY" and mark_price <= stop_price:
+                decision_expl = (
+                    f"In position ({side}) – ATR15={atr_15:.2f}, entry={entry_price:.2f}, "
+                    f"SL={sl:.2f}, TP={tp:.2f}, mark={mark_price:.2f}."
+                )
+
+                exited = False
+
+                # SL / TP logic
+                if side == "BUY" and mark_price <= sl:
                     client.create_market_order(SYMBOL, "SELL", qty, reduce_only=True)
                     pnl, pnl_pct = compute_pnl(entry_price, mark_price, qty, side)
                     msg = (
-                        f"❌ Stop-loss hit on LONG {SYMBOL}\n"
+                        f"❌ SL hit on LONG {SYMBOL}\n"
                         f"Qty: {qty}\n"
                         f"Entry: {entry_price:.2f}\n"
                         f"Exit:  {mark_price:.2f}\n"
+                        f"ATR15: {atr_15:.2f}\n"
                         f"PnL:   {pnl:.2f} USDT ({pnl_pct:.2f}%)"
                     )
                     send_telegram_message(msg)
-                    print(f"[INFO] SL hit on long {SYMBOL} at {mark_price}, pnl={pnl:.2f} USDT")
-                elif side == "SELL" and mark_price >= stop_price:
+                    print(f"[INFO] SL hit on LONG {SYMBOL} at {mark_price}, pnl={pnl:.2f} USDT")
+                    decision_expl += " Decision: EXIT via SL (long)."
+                    exited = True
+
+                elif side == "BUY" and mark_price >= tp:
+                    client.create_market_order(SYMBOL, "SELL", qty, reduce_only=True)
+                    pnl, pnl_pct = compute_pnl(entry_price, mark_price, qty, side)
+                    msg = (
+                        f"✅ TP hit on LONG {SYMBOL}\n"
+                        f"Qty: {qty}\n"
+                        f"Entry: {entry_price:.2f}\n"
+                        f"Exit:  {mark_price:.2f}\n"
+                        f"ATR15: {atr_15:.2f}\n"
+                        f"PnL:   {pnl:.2f} USDT ({pnl_pct:.2f}%)"
+                    )
+                    send_telegram_message(msg)
+                    print(f"[INFO] TP hit on LONG {SYMBOL} at {mark_price}, pnl={pnl:.2f} USDT")
+                    decision_expl += " Decision: EXIT via TP (long)."
+                    exited = True
+
+                elif side == "SELL" and mark_price >= sl:
                     client.create_market_order(SYMBOL, "BUY", qty, reduce_only=True)
                     pnl, pnl_pct = compute_pnl(entry_price, mark_price, qty, side)
                     msg = (
-                        f"❌ Stop-loss hit on SHORT {SYMBOL}\n"
+                        f"❌ SL hit on SHORT {SYMBOL}\n"
                         f"Qty: {qty}\n"
                         f"Entry: {entry_price:.2f}\n"
                         f"Exit:  {mark_price:.2f}\n"
+                        f"ATR15: {atr_15:.2f}\n"
                         f"PnL:   {pnl:.2f} USDT ({pnl_pct:.2f}%)"
                     )
                     send_telegram_message(msg)
-                    print(f"[INFO] SL hit on short {SYMBOL} at {mark_price}, pnl={pnl:.2f} USDT")
-                else:
-                    # Indicator-based exit (trend shift)
-                    if should_exit_by_indicators(client):
-                        exit_side = "SELL" if side == "BUY" else "BUY"
-                        client.create_market_order(SYMBOL, exit_side, qty, reduce_only=True)
-                        pnl, pnl_pct = compute_pnl(entry_price, mark_price, qty, side)
-                        msg = (
-                            f"🔁 Indicator exit on {side} {SYMBOL}\n"
-                            f"Qty: {qty}\n"
-                            f"Entry: {entry_price:.2f}\n"
-                            f"Exit:  {mark_price:.2f}\n"
-                            f"PnL:   {pnl:.2f} USDT ({pnl_pct:.2f}%)"
-                        )
-                        send_telegram_message(msg)
-                        print(f"[INFO] Indicator-based exit on {side} {SYMBOL} at {mark_price}, pnl={pnl:.2f} USDT")
+                    print(f"[INFO] SL hit on SHORT {SYMBOL} at {mark_price}, pnl={pnl:.2f} USDT")
+                    decision_expl += " Decision: EXIT via SL (short)."
+                    exited = True
+
+                elif side == "SELL" and mark_price <= tp:
+                    client.create_market_order(SYMBOL, "BUY", qty, reduce_only=True)
+                    pnl, pnl_pct = compute_pnl(entry_price, mark_price, qty, side)
+                    msg = (
+                        f"✅ TP hit on SHORT {SYMBOL}\n"
+                        f"Qty: {qty}\n"
+                        f"Entry: {entry_price:.2f}\n"
+                        f"Exit:  {mark_price:.2f}\n"
+                        f"ATR15: {atr_15:.2f}\n"
+                        f"PnL:   {pnl:.2f} USDT ({pnl_pct:.2f}%)"
+                    )
+                    send_telegram_message(msg)
+                    print(f"[INFO] TP hit on SHORT {SYMBOL} at {mark_price}, pnl={pnl:.2f} USDT")
+                    decision_expl += " Decision: EXIT via TP (short)."
+                    exited = True
+
+                if not exited:
+                    decision_expl += " Decision: HOLD – price between SL and TP."
+
+                # Every 5m: explanation to logs & Telegram
+                print(f"[INFO] Decision loop (in position): {decision_expl}")
+                send_telegram_message(f"📊 Decision loop:\n{decision_expl}")
 
             else:
-                # --- No open position: maybe open a new one ---
-                if allowed:
-                    kl_5 = client.get_klines(SYMBOL, TF_MAIN, limit=200)
-                    kl_15 = client.get_klines(SYMBOL, TF_MID, limit=200)
-                    kl_1h = client.get_klines(SYMBOL, TF_HIGH, limit=200)
-                    order_book = client.get_order_book(SYMBOL, limit=20)
+                # --- Flat: evaluate new entry ---
+                signal, expl = evaluate_strategy(kl_15, kl_30, kl_1h)
+                # Explain decision every loop
+                print(f"[INFO] Decision loop (flat):\n{expl}")
+                send_telegram_message(f"📊 Decision loop:\n{expl}")
 
-                    signal = evaluate_strategy(kl_5, kl_15, kl_1h, order_book)
-                    if signal:
-                        qty = compute_position_size(wallet_balance, mark_price)
-                        if qty > 0:
-                            client.create_market_order(SYMBOL, signal.side, qty)
-                            # Give exchange a tiny moment to register the position, then read entry
-                            time.sleep(1)
-                            new_pos = get_open_position_info(client)
-                            if new_pos:
-                                entry_price = new_pos["entry_price"]
-                            else:
-                                entry_price = mark_price
+                if signal and allowed:
+                    qty = compute_position_size(wallet_balance, mark_price)
+                    if qty > 0:
+                        client.create_market_order(SYMBOL, signal.side, qty)
+                        # Give exchange a tiny moment to register the position, then read entry
+                        time.sleep(1)
+                        new_pos = get_open_position_info(client)
+                        if new_pos:
+                            entry_price = new_pos["entry_price"]
+                        else:
+                            entry_price = mark_price
 
-                            msg = (
-                                f"✅ Opened {signal.side} {SYMBOL}\n"
-                                f"Qty:   {qty}\n"
-                                f"Entry: {entry_price:.2f}\n"
-                                f"Reason: {signal.reason}"
-                            )
-                            send_telegram_message(msg)
-                            print(
-                                f"[INFO] Opened {signal.side} {SYMBOL}, "
-                                f"qty={qty}, entry≈{entry_price}, reason={signal.reason}"
-                            )
-                    else:
-                        # No trade this loop, log a compact heartbeat
-                        print(
-                            f"[INFO] No signal this loop. "
-                            f"equity={equity}, wallet={wallet_balance}, price={mark_price}"
+                        msg = (
+                            f"✅ Opened {signal.side} {SYMBOL}\n"
+                            f"Qty:   {qty}\n"
+                            f"Entry: {entry_price:.2f}\n"
+                            f"Reason: {signal.reason}"
                         )
-                else:
-                    print("[INFO] Daily drawdown limit hit, not opening new positions today.")
+                        send_telegram_message(msg)
+                        print(
+                            f"[INFO] Opened {signal.side} {SYMBOL}, "
+                            f"qty={qty}, entry≈{entry_price}, reason={signal.reason}"
+                        )
+                elif signal and not allowed:
+                    # You have a signal but risk rules say no new trades today
+                    print("[INFO] Signal present but daily drawdown limit hit, not opening new position.")
+                    send_telegram_message(
+                        "⚠️ Signal detected but daily drawdown limit hit. No new positions opened today."
+                    )
 
         except Exception as e:
             import traceback
