@@ -12,7 +12,7 @@ from config import (
     MIN_VOLUME_FACTOR_RANGE,
     MAX_RELATIVE_SPREAD,
 )
-from indicators import ema, rsi, macd, atr, bollinger_bands, adx
+from indicators import ema, rsi, macd, bollinger_bands, adx
 
 
 Side = Literal["BUY", "SELL"]
@@ -44,7 +44,10 @@ def evaluate_strategy(
     order_book: Dict[str, Any],
 ) -> Optional[Signal]:
     """
-    Returns a Signal or None (no trade).
+    Returns a Signal (BUY/SELL) or None (no trade).
+
+    This version is "looser": trades more often while keeping the same
+    multi-timeframe trend + range structure and basic liquidity checks.
     """
     df5 = _prepare_ohlc_df(klines_5m).iloc[:-1]   # drop last (potentially incomplete) candle
     df15 = _prepare_ohlc_df(klines_15m).iloc[:-1]
@@ -53,15 +56,19 @@ def evaluate_strategy(
     if len(df5) < 60 or len(df15) < 60 or len(df1h) < 60:
         return None
 
-    # ---- Trend filter on 1h ----
+    # ---- Trend filter on 1h (looser ADX) ----
     df1h["ema50"] = ema(df1h["close"], 50)
     df1h["ema200"] = ema(df1h["close"], 200)
     df1h["adx"] = adx(df1h)
 
     last1h = df1h.iloc[-1]
-    if last1h["ema50"] > last1h["ema200"] and last1h["adx"] > ADX_THRESHOLD_TREND:
+
+    # Allow trend from a bit lower ADX to loosen things up
+    effective_adx_threshold = ADX_THRESHOLD_TREND * 0.75
+
+    if last1h["ema50"] > last1h["ema200"] and last1h["adx"] > effective_adx_threshold:
         big_trend = "UP"
-    elif last1h["ema50"] < last1h["ema200"] and last1h["adx"] > ADX_THRESHOLD_TREND:
+    elif last1h["ema50"] < last1h["ema200"] and last1h["adx"] > effective_adx_threshold:
         big_trend = "DOWN"
     else:
         big_trend = "RANGE"
@@ -87,12 +94,15 @@ def evaluate_strategy(
     df5["bb_upper"] = upper_bb
 
     last5 = df5.iloc[-1]
-    prev5 = df5.iloc[-2]
 
-    # ---- Volume filter ----
+    # ---- Volume baseline ----
     vol_ma20 = last5["vol_ma20"]
     if vol_ma20 is None or vol_ma20 == 0:
         return None
+
+    # Softer volume multipliers
+    trend_vol_factor = min(0.6, MIN_VOLUME_FACTOR_TREND)
+    range_vol_factor = min(0.4, MIN_VOLUME_FACTOR_RANGE)
 
     # ---- Order book / liquidity filter ----
     bids = order_book.get("bids", [])
@@ -105,6 +115,7 @@ def evaluate_strategy(
     mid_price = (best_bid + best_ask) / 2
     spread = (best_ask - best_bid) / mid_price
 
+    # Keep spread sanity check
     if spread > MAX_RELATIVE_SPREAD:
         return None
 
@@ -113,46 +124,50 @@ def evaluate_strategy(
 
     bid_depth = depth_sum(bids[:20])
     ask_depth = depth_sum(asks[:20])
+    if bid_depth <= 0 or ask_depth <= 0:
+        return None
 
-    # ---- Trend-following mode ----
+    # ---- Trend-following mode (UP/DOWN) ----
+    # Looser: just need momentum confirmation, not strict crossovers
+
     if big_trend == "UP" and mid_up:
-        # Pullback long: RSI crosses up from below 45, MACD hist from negative to positive
-        rsi_cross_up = prev5["rsi"] < 45 <= last5["rsi"]
-        macd_bull = prev5["macd_hist"] < 0 <= last5["macd_hist"]
-        vol_ok = last5["volume"] > MIN_VOLUME_FACTOR_TREND * vol_ma20
-        price_above_ema = last5["close"] > last5["ema50"]
-        bid_support = bid_depth >= 0.9 * ask_depth
+        # Long conditions:
+        price_above_ema20 = last5["close"] > last5["ema20"]
+        rsi_ok = last5["rsi"] > 45           # previously needed cross, now just >45
+        macd_bull = last5["macd_hist"] > 0   # just positive, no cross needed
+        vol_ok = last5["volume"] > trend_vol_factor * vol_ma20
 
-        if rsi_cross_up and macd_bull and vol_ok and price_above_ema and bid_support:
-            return Signal(side="BUY", reason="UP trend pullback long")
+        if price_above_ema20 and rsi_ok and macd_bull and vol_ok:
+            return Signal(side="BUY", reason="UP trend, 5m EMA20+RSI>45+MACD>0")
 
     if big_trend == "DOWN" and mid_down:
-        # Pullback short: RSI crosses down from above 55, MACD hist from positive to negative
-        rsi_cross_down = prev5["rsi"] > 55 >= last5["rsi"]
-        macd_bear = prev5["macd_hist"] > 0 >= last5["macd_hist"]
-        vol_ok = last5["volume"] > MIN_VOLUME_FACTOR_TREND * vol_ma20
-        price_below_ema = last5["close"] < last5["ema50"]
-        ask_pressure = ask_depth >= 0.9 * bid_depth
+        # Short conditions:
+        price_below_ema20 = last5["close"] < last5["ema20"]
+        rsi_ok = last5["rsi"] < 55           # previously stricter
+        macd_bear = last5["macd_hist"] < 0   # just negative
+        vol_ok = last5["volume"] > trend_vol_factor * vol_ma20
 
-        if rsi_cross_down and macd_bear and vol_ok and price_below_ema and ask_pressure:
-            return Signal(side="SELL", reason="DOWN trend pullback short")
+        if price_below_ema20 and rsi_ok and macd_bear and vol_ok:
+            return Signal(side="SELL", reason="DOWN trend, 5m EMA20+RSI<55+MACD<0")
 
     # ---- Range / mean-reversion mode ----
     if big_trend == "RANGE":
-        vol_ok = last5["volume"] > MIN_VOLUME_FACTOR_RANGE * vol_ma20
+        vol_ok = last5["volume"] > range_vol_factor * vol_ma20
 
-        # Long at lower band
-        is_touch_lower = last5["close"] <= last5["bb_lower"]
-        rsi_rebound = prev5["rsi"] < RSI_OVERSOLD <= last5["rsi"]
+        lower_band = last5["bb_lower"]
+        upper_band = last5["bb_upper"]
 
-        if is_touch_lower and rsi_rebound and vol_ok:
-            return Signal(side="BUY", reason="Range long at lower Bollinger")
+        if lower_band and upper_band:
+            # Range long near lower band
+            touch_lower = last5["close"] <= lower_band * 1.005  # within ~0.5% of lower band
+            rsi_low = last5["rsi"] < max(40, RSI_OVERSOLD + 10)  # usually <40
+            if touch_lower and rsi_low and vol_ok:
+                return Signal(side="BUY", reason="Range long near lower Bollinger, RSI low")
 
-        # Short at upper band
-        is_touch_upper = last5["close"] >= last5["bb_upper"]
-        rsi_rollover = prev5["rsi"] > RSI_OVERBOUGHT >= last5["rsi"]
-
-        if is_touch_upper and rsi_rollover and vol_ok:
-            return Signal(side="SELL", reason="Range short at upper Bollinger")
+            # Range short near upper band
+            touch_upper = last5["close"] >= upper_band * 0.995  # within ~0.5% of upper band
+            rsi_high = last5["rsi"] > min(60, RSI_OVERBOUGHT - 10)  # usually >60
+            if touch_upper and rsi_high and vol_ok:
+                return Signal(side="SELL", reason="Range short near upper Bollinger, RSI high")
 
     return None

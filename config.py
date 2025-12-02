@@ -43,9 +43,9 @@ RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
 
 # Volume & liquidity filters
-MIN_VOLUME_FACTOR_TREND = 0.8
-MIN_VOLUME_FACTOR_RANGE = 0.5
-MAX_RELATIVE_SPREAD = 0.0005  # 0.05%
+MIN_VOLUME_FACTOR_TREND = 0.6     # was 0.8
+MIN_VOLUME_FACTOR_RANGE = 0.4     # was 0.5
+MAX_RELATIVE_SPREAD = 0.001       # allow up to 0.1% spread
 
 # -------- Scheduler --------
 

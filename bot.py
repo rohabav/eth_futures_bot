@@ -131,6 +131,25 @@ def should_exit_by_indicators(client, tf: str = "5m") -> bool:
     return (prev["macd_hist"] > 0 >= last["macd_hist"]) or (prev["macd_hist"] < 0 <= last["macd_hist"])
 
 
+def compute_pnl(entry_price: float, exit_price: float, qty: float, side: str):
+    """
+    Approximate realized PnL in USDT and % on the position notional.
+    For USDT-margined futures, PnL = (exit - entry) * qty for long,
+    and (entry - exit) * qty for short.
+    """
+    if qty <= 0 or entry_price <= 0:
+        return 0.0, 0.0
+
+    if side == "BUY":
+        pnl = (exit_price - entry_price) * qty
+    else:
+        pnl = (entry_price - exit_price) * qty
+
+    notional = entry_price * qty
+    pnl_pct = (pnl / notional) * 100 if notional > 0 else 0.0
+    return pnl, pnl_pct
+
+
 def main():
     print("[INFO] Initializing Binance client...")
     client = init_client()
@@ -141,7 +160,7 @@ def main():
 
     risk_state = init_risk_state(equity)
 
-    send_telegram_message(f"ETH Futures bot started on {datetime.now(timezone.utc)} (env active).")
+    send_telegram_message(f"🚀 ETH Futures bot started on {datetime.now(timezone.utc)} (env active).")
     print("[INFO] Entering main loop...")
 
     while True:
@@ -166,23 +185,43 @@ def main():
                 # Hard stop-loss
                 if side == "BUY" and mark_price <= stop_price:
                     client.create_market_order(SYMBOL, "SELL", qty, reduce_only=True)
-                    send_telegram_message(
-                        f"Stop-loss hit on long {SYMBOL}: entry={entry_price}, stop={stop_price}, mark={mark_price}"
+                    pnl, pnl_pct = compute_pnl(entry_price, mark_price, qty, side)
+                    msg = (
+                        f"❌ Stop-loss hit on LONG {SYMBOL}\n"
+                        f"Qty: {qty}\n"
+                        f"Entry: {entry_price:.2f}\n"
+                        f"Exit:  {mark_price:.2f}\n"
+                        f"PnL:   {pnl:.2f} USDT ({pnl_pct:.2f}%)"
                     )
-                    print(f"[INFO] SL hit on long {SYMBOL} at {mark_price}")
+                    send_telegram_message(msg)
+                    print(f"[INFO] SL hit on long {SYMBOL} at {mark_price}, pnl={pnl:.2f} USDT")
                 elif side == "SELL" and mark_price >= stop_price:
                     client.create_market_order(SYMBOL, "BUY", qty, reduce_only=True)
-                    send_telegram_message(
-                        f"Stop-loss hit on short {SYMBOL}: entry={entry_price}, stop={stop_price}, mark={mark_price}"
+                    pnl, pnl_pct = compute_pnl(entry_price, mark_price, qty, side)
+                    msg = (
+                        f"❌ Stop-loss hit on SHORT {SYMBOL}\n"
+                        f"Qty: {qty}\n"
+                        f"Entry: {entry_price:.2f}\n"
+                        f"Exit:  {mark_price:.2f}\n"
+                        f"PnL:   {pnl:.2f} USDT ({pnl_pct:.2f}%)"
                     )
-                    print(f"[INFO] SL hit on short {SYMBOL} at {mark_price}")
+                    send_telegram_message(msg)
+                    print(f"[INFO] SL hit on short {SYMBOL} at {mark_price}, pnl={pnl:.2f} USDT")
                 else:
                     # Indicator-based exit (trend shift)
                     if should_exit_by_indicators(client):
                         exit_side = "SELL" if side == "BUY" else "BUY"
                         client.create_market_order(SYMBOL, exit_side, qty, reduce_only=True)
-                        send_telegram_message(f"Indicator exit on {side} {SYMBOL} at mark {mark_price}")
-                        print(f"[INFO] Indicator-based exit on {side} {SYMBOL} at {mark_price}")
+                        pnl, pnl_pct = compute_pnl(entry_price, mark_price, qty, side)
+                        msg = (
+                            f"🔁 Indicator exit on {side} {SYMBOL}\n"
+                            f"Qty: {qty}\n"
+                            f"Entry: {entry_price:.2f}\n"
+                            f"Exit:  {mark_price:.2f}\n"
+                            f"PnL:   {pnl:.2f} USDT ({pnl_pct:.2f}%)"
+                        )
+                        send_telegram_message(msg)
+                        print(f"[INFO] Indicator-based exit on {side} {SYMBOL} at {mark_price}, pnl={pnl:.2f} USDT")
 
             else:
                 # --- No open position: maybe open a new one ---
@@ -196,13 +235,25 @@ def main():
                     if signal:
                         qty = compute_position_size(wallet_balance, mark_price)
                         if qty > 0:
-                            resp = client.create_market_order(SYMBOL, signal.side, qty)
-                            send_telegram_message(
-                                f"Opened {signal.side} {SYMBOL}, qty={qty}, price≈{mark_price}, reason={signal.reason}"
+                            client.create_market_order(SYMBOL, signal.side, qty)
+                            # Give exchange a tiny moment to register the position, then read entry
+                            time.sleep(1)
+                            new_pos = get_open_position_info(client)
+                            if new_pos:
+                                entry_price = new_pos["entry_price"]
+                            else:
+                                entry_price = mark_price
+
+                            msg = (
+                                f"✅ Opened {signal.side} {SYMBOL}\n"
+                                f"Qty:   {qty}\n"
+                                f"Entry: {entry_price:.2f}\n"
+                                f"Reason: {signal.reason}"
                             )
+                            send_telegram_message(msg)
                             print(
-                                f"[INFO] Opened {signal.side} {SYMBOL}, qty={qty}, price≈{mark_price}, "
-                                f"reason={signal.reason}"
+                                f"[INFO] Opened {signal.side} {SYMBOL}, "
+                                f"qty={qty}, entry≈{entry_price}, reason={signal.reason}"
                             )
                     else:
                         # No trade this loop, log a compact heartbeat
