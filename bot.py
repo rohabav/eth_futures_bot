@@ -9,7 +9,6 @@ from config import (
     SYMBOL,
     CHECK_INTERVAL_SECONDS,
     TF_MAIN,
-    TF_MID,
     TF_HIGH,
     ATR_PERIOD,
     ATR_SL_MULTIPLIER,
@@ -34,50 +33,23 @@ def get_wallet_equity_and_balance(client):
       - totalWalletBalance as 'equity'
       - USDT walletBalance as 'wallet_balance'
 
-    Logs a compact summary:
-      - equity
-      - USDT asset
-      - ETHUSDT position (if any)
+    Returns (equity, wallet_balance).
     """
-    acct = client.get_account()
+    acct = client._request("GET", "/fapi/v2/account", signed=True, params={})
+    equity = float(acct["totalWalletBalance"])
 
-    # Total wallet equity (all assets converted to USDT)
-    equity = float(acct.get("totalWalletBalance", 0.0))
-
-    # Find USDT asset only
     wallet_balance = 0.0
-    usdt_asset = None
-    for a in acct.get("assets", []):
-        if a.get("asset") == "USDT":
-            wallet_balance = float(a.get("walletBalance", 0.0))
-            usdt_asset = a
+    for asset in acct.get("assets", []):
+        if asset.get("asset") == "USDT":
+            wallet_balance = float(asset.get("walletBalance", 0.0))
             break
-
-    # Optional: find ETHUSDT position only
-    eth_pos = None
-    for p in acct.get("positions", []):
-        if p.get("symbol") == SYMBOL:
-            eth_pos = p
-            break
-
-    print("[DEBUG] Account summary:")
-    print(f"  equity (totalWalletBalance) = {equity}")
-    if usdt_asset:
-        print(f"  USDT walletBalance         = {wallet_balance}")
-    if eth_pos:
-        print(
-            "  ETHUSDT position: "
-            f"amt={eth_pos.get('positionAmt')}, "
-            f"entry={eth_pos.get('entryPrice')}, "
-            f"unrealized={eth_pos.get('unrealizedProfit')}"
-        )
 
     return equity, wallet_balance
 
 
-def get_open_position_info(client):
+def get_open_position_info(client) -> Optional[dict]:
     """
-    Returns info about open ETHUSDT position, or None if flat.
+    Returns info about open position for SYMBOL, or None if flat.
     """
     positions = client.get_positions()
     for p in positions:
@@ -94,14 +66,26 @@ def get_open_position_info(client):
 
 
 def _klines_to_df(klines) -> pd.DataFrame:
+    """
+    Convert klines to a DataFrame with columns:
+    open, high, low, close, volume.
+    """
     cols = [
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_asset_volume", "number_of_trades",
-        "taker_buy_base", "taker_buy_quote", "ignore",
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "close_time",
+        "quote_asset_volume",
+        "number_of_trades",
+        "taker_buy_base",
+        "taker_buy_quote",
+        "ignore",
     ]
     df = pd.DataFrame(klines, columns=cols)
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
+    df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
     return df
 
 
@@ -159,9 +143,8 @@ def main():
             pos_info: Optional[dict] = get_open_position_info(client)
             mark_price = get_mark_price(client)
 
-            # --- Fetch candles for all timeframes (used for both entry & ATR exits) ---
+            # --- Fetch candles for timeframes (used for both entry & ATR exits) ---
             kl_15 = client.get_klines(SYMBOL, TF_MAIN, limit=200)   # 15m
-            kl_30 = client.get_klines(SYMBOL, TF_MID, limit=200)    # 30m
             kl_1h = client.get_klines(SYMBOL, TF_HIGH, limit=200)   # 1h
 
             atr_15 = compute_atr_from_15m(kl_15)
@@ -254,16 +237,14 @@ def main():
                 if not exited:
                     decision_expl += " Decision: HOLD – price between SL and TP."
 
-                # Every 5m: explanation to logs & Telegram
+                # Every loop: explanation to logs only (no Telegram spam)
                 print(f"[INFO] Decision loop (in position): {decision_expl}")
-                send_telegram_message(f"📊 Decision loop:\n{decision_expl}")
 
             else:
                 # --- Flat: evaluate new entry ---
-                signal, expl = evaluate_strategy(kl_15, kl_30, kl_1h)
-                # Explain decision every loop
+                signal, expl = evaluate_strategy(kl_15, kl_1h)
+                # Explain decision every loop to logs only (no Telegram spam)
                 print(f"[INFO] Decision loop (flat):\n{expl}")
-                send_telegram_message(f"📊 Decision loop:\n{expl}")
 
                 if signal and allowed:
                     qty = compute_position_size(wallet_balance, mark_price)

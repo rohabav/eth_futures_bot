@@ -24,40 +24,61 @@ class Signal:
 
 
 def _prepare_ohlc_df(klines) -> pd.DataFrame:
-    # Binance futures kline format: [openTime, open, high, low, close, volume, ...]
+    """
+    Convert Binance futures kline array to a numeric DataFrame.
+
+    Expected kline format:
+    [openTime, open, high, low, close, volume,
+     closeTime, quoteAssetVolume, numberOfTrades,
+     takerBuyBase, takerBuyQuote, ignore]
+    """
     cols = [
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_asset_volume", "number_of_trades",
-        "taker_buy_base", "taker_buy_quote", "ignore",
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "close_time",
+        "quote_asset_volume",
+        "number_of_trades",
+        "taker_buy_base",
+        "taker_buy_quote",
+        "ignore",
     ]
     df = pd.DataFrame(klines, columns=cols)
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
+    numeric_cols = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "quote_asset_volume",
+        "taker_buy_base",
+        "taker_buy_quote",
+    ]
+    df[numeric_cols] = df[numeric_cols].astype(float)
     return df
 
 
 def evaluate_strategy(
     klines_15m,
-    klines_30m,
     klines_1h,
 ) -> Tuple[Optional[Signal], str]:
     """
     Returns (Signal or None, detailed_explanation_string).
 
-    Structure:
-    - 1h: context trend using EMA50/EMA100 + ADX.
-    - 30m: main trend direction (EMA50/EMA100 + ADX).
-    - 15m: entry timing (RSI crosses, MACD 8/17/5, price vs EMA, volume).
-    - Range regime: Bollinger + RSI at extremes.
-
-    IMPORTANT: no order book logic here anymore.
+    Updated structure (only 1h & 15m):
+      - 1h: context trend using EMA50/EMA100 + ADX.
+      - 15m: entry timing (RSI crosses, MACD 8/17/5, price vs EMA, volume).
+      - Range regime: Bollinger + RSI extremes.
     """
-    df15 = _prepare_ohlc_df(klines_15m).iloc[:-1]   # drop last (potentially incomplete) candle
-    df30 = _prepare_ohlc_df(klines_30m).iloc[:-1]
+    # Drop last (potentially incomplete) candle on each TF
+    df15 = _prepare_ohlc_df(klines_15m).iloc[:-1]
     df1h = _prepare_ohlc_df(klines_1h).iloc[:-1]
 
-    if len(df15) < 60 or len(df30) < 60 or len(df1h) < 60:
-        return None, "Not enough candles on one of the timeframes (need ~60 each)."
+    if len(df15) < 60 or len(df1h) < 60:
+        return None, "Not enough candles on one of the timeframes (need ~60 on 15m & 1h)."
 
     explanation_parts = []
 
@@ -82,35 +103,11 @@ def evaluate_strategy(
         f"1h: EMA50={ema50_1h:.2f}, EMA100={ema100_1h:.2f}, ADX={adx_1h:.1f} -> big_trend={big_trend}"
     )
 
-    # ---------- 30m trend ----------
-    df30["ema50"] = ema(df30["close"], 50)
-    df30["ema100"] = ema(df30["close"], 100)
-    df30["adx"] = adx(df30)
-
-    last30 = df30.iloc[-1]
-    ema50_30 = last30["ema50"]
-    ema100_30 = last30["ema100"]
-    adx_30 = last30["adx"]
-
-    mid_up = ema50_30 > ema100_30
-    mid_down = ema50_30 < ema100_30
-
-    if mid_up:
-        mid_trend = "UP"
-    elif mid_down:
-        mid_trend = "DOWN"
-    else:
-        mid_trend = "FLAT"
-
-    explanation_parts.append(
-        f"30m: EMA50={ema50_30:.2f}, EMA100={ema100_30:.2f}, ADX={adx_30:.1f} -> mid_trend={mid_trend}"
-    )
-
     # ---------- 15m entry timeframe ----------
     df15["ema50"] = ema(df15["close"], 50)
     df15["ema100"] = ema(df15["close"], 100)
     df15["rsi"] = rsi(df15["close"], 14)
-    macd_line, signal_line, hist = macd(df15["close"])  # uses 8/17/5 by default
+    macd_line, signal_line, hist = macd(df15["close"])  # uses 8/17/5 by default (see config)
     df15["macd_hist"] = hist
     df15["vol_ma20"] = df15["volume"].rolling(20).mean()
     lower_bb, mid_bb, upper_bb = bollinger_bands(df15["close"], 20, 2.0)
@@ -132,7 +129,7 @@ def evaluate_strategy(
     bb_upper = last15["bb_upper"]
     close_15 = last15["close"]
 
-    if vol_ma20 is None or vol_ma20 == 0:
+    if pd.isna(vol_ma20) or vol_ma20 == 0:
         return None, "15m volume MA is zero/NaN, skipping trading."
 
     explanation_parts.append(
@@ -144,21 +141,21 @@ def evaluate_strategy(
 
     # ---------- Conditions ----------
 
-    # Trend-following LONG: big UP, mid UP, RSI cross up, MACD cross up, price above EMA50, sufficient volume
+    # Trend-following LONG: 1h UP, RSI cross up, MACD cross up, price above EMA50, sufficient volume
     rsi_cross_up = rsi_prev < 45 <= rsi_last
     macd_bull = macd_hist_prev < 0 <= macd_hist_last
     price_above_ema50 = close_15 > ema50_15
     vol_ok_trend = vol_last > MIN_VOLUME_FACTOR_TREND * vol_ma20
 
-    long_trend_ok = (big_trend == "UP") and (mid_trend == "UP")
+    long_trend_ok = big_trend == "UP"
 
-    # Trend-following SHORT: big DOWN, mid DOWN, RSI cross down, MACD cross down, price below EMA50, sufficient volume
+    # Trend-following SHORT: 1h DOWN, RSI cross down, MACD cross down, price below EMA50, sufficient volume
     rsi_cross_down = rsi_prev > 55 >= rsi_last
     macd_bear = macd_hist_prev > 0 >= macd_hist_last
     price_below_ema50 = close_15 < ema50_15
     vol_ok_trend_short = vol_last > MIN_VOLUME_FACTOR_TREND * vol_ma20
 
-    short_trend_ok = (big_trend == "DOWN") and (mid_trend == "DOWN")
+    short_trend_ok = big_trend == "DOWN"
 
     # Range / mean-reversion mode
     range_vol_ok = vol_last > MIN_VOLUME_FACTOR_RANGE * vol_ma20
@@ -176,19 +173,20 @@ def evaluate_strategy(
 
     if long_trend_ok and rsi_cross_up and macd_bull and price_above_ema50 and vol_ok_trend:
         explanation_parts.append("Decision: OPEN LONG (trend-following) – all long conditions satisfied.")
-        return Signal(side="BUY", reason="Trend long (1h+30m up, RSI/MACD cross up, EMA50 support)"), "\n".join(
-            explanation_parts
-        )
+        return Signal(
+            side="BUY",
+            reason="Trend long (1h up, RSI/MACD cross up, EMA50 support)",
+        ), "\n".join(explanation_parts)
 
     if short_trend_ok and rsi_cross_down and macd_bear and price_below_ema50 and vol_ok_trend_short:
         explanation_parts.append("Decision: OPEN SHORT (trend-following) – all short conditions satisfied.")
-        return Signal(side="SELL", reason="Trend short (1h+30m down, RSI/MACD cross down, EMA50 resistance)"), "\n".join(
-            explanation_parts
-        )
+        return Signal(
+            side="SELL",
+            reason="Trend short (1h down, RSI/MACD cross down, EMA50 resistance)",
+        ), "\n".join(explanation_parts)
 
-    # ---------- Range entries ----------
-
-    if big_trend == "RANGE" and bb_lower and bb_upper:
+    # ---------- Range entries (only when 1h regime is RANGE) ----------
+    if big_trend == "RANGE":
         # Range long near lower band, RSI rebounding from oversold
         touch_lower = close_15 <= bb_lower
         rsi_rebound = rsi_prev < RSI_OVERSOLD <= rsi_last
@@ -197,7 +195,10 @@ def evaluate_strategy(
             explanation_parts.append(
                 "Decision: OPEN LONG (range) – price at lower Bollinger, RSI rebounding from oversold, volume ok."
             )
-            return Signal(side="BUY", reason="Range long at lower Bollinger"), "\n".join(explanation_parts)
+            return Signal(
+                side="BUY",
+                reason="Range long at lower Bollinger",
+            ), "\n".join(explanation_parts)
 
         # Range short near upper band, RSI rolling over from overbought
         touch_upper = close_15 >= bb_upper
@@ -207,14 +208,18 @@ def evaluate_strategy(
             explanation_parts.append(
                 "Decision: OPEN SHORT (range) – price at upper Bollinger, RSI rolling from overbought, volume ok."
             )
-            return Signal(side="SELL", reason="Range short at upper Bollinger"), "\n".join(explanation_parts)
+            return Signal(
+                side="SELL",
+                reason="Range short at upper Bollinger",
+            ), "\n".join(explanation_parts)
 
     # ---------- No trade ----------
     if big_trend in ("UP", "DOWN"):
+        # Trend mode but something missing – enumerate reasons for transparency
         fail_reasons = []
         if big_trend == "UP":
             if not long_trend_ok:
-                fail_reasons.append("1h/30m trend alignment not strong up.")
+                fail_reasons.append("1h trend alignment not strong up.")
             if not rsi_cross_up:
                 fail_reasons.append("RSI did not cross up through 45.")
             if not macd_bull:
@@ -225,7 +230,7 @@ def evaluate_strategy(
                 fail_reasons.append("Trend volume not high enough.")
         else:
             if not short_trend_ok:
-                fail_reasons.append("1h/30m trend alignment not strong down.")
+                fail_reasons.append("1h trend alignment not strong down.")
             if not rsi_cross_down:
                 fail_reasons.append("RSI did not cross down through 55.")
             if not macd_bear:
@@ -236,7 +241,8 @@ def evaluate_strategy(
                 fail_reasons.append("Trend volume not high enough.")
 
         explanation_parts.append(
-            "Decision: NO TRADE (trend mode) – " + ("; ".join(fail_reasons) if fail_reasons else "conditions ambiguous.")
+            "Decision: NO TRADE (trend mode) – "
+            + ("; ".join(fail_reasons) if fail_reasons else "conditions ambiguous.")
         )
     else:
         explanation_parts.append(

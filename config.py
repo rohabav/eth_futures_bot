@@ -14,7 +14,10 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 # Base URL for Binance USDT-margined futures.
 # Override in .env if needed.
-BINANCE_FAPI_BASE = os.getenv("BINANCE_FAPI_BASE", "https://testnet.binancefuture.com")
+BINANCE_FAPI_BASE = os.getenv(
+    "BINANCE_FAPI_BASE",
+    "https://testnet.binancefuture.com",
+)
 
 # Trading symbol
 SYMBOL = os.getenv("SYMBOL", "ETHUSDT")
@@ -45,14 +48,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", 300))
 
 # ===========================
-#  Timeframes (you requested 1h / 30m / 15m)
+#  Timeframes (bot uses 1h & 15m)
 # ===========================
 
 # Entry / fine trend timeframe
 TF_MAIN = os.getenv("TF_MAIN", "15m")
-
-# Medium trend timeframe
-TF_MID = os.getenv("TF_MID", "30m")
 
 # Higher timeframe context
 TF_HIGH = os.getenv("TF_HIGH", "1h")
@@ -68,9 +68,17 @@ POSITION_SIZE_PCT = float(os.getenv("POSITION_SIZE_PCT", 0.10))  # 0.10 = 10%
 # this % from day's start (daily drawdown)
 MAX_DAILY_DRAWDOWN_PCT = float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", 0.10))  # 10%
 
-# Backwards-compatibility aliases for risk.py
+# Backwards-compatibility aliases for risk.py (older names)
 TRADE_BALANCE_FRACTION = POSITION_SIZE_PCT
 DAILY_DRAWDOWN_LIMIT = MAX_DAILY_DRAWDOWN_PCT
+
+# Extra safety: maximum allowed notional relative to equity (e.g. 5x)
+# If equity is 5,000 USDT and this is 5.0 => max notional ≈ 25,000 USDT
+MAX_NOTIONAL_MULTIPLIER = float(os.getenv("MAX_NOTIONAL_MULTIPLIER", 5.0))
+
+# Kept for backwards compatibility with any old code that might reference it.
+# The new bot uses ATR-based SL/TP instead of this.
+DEFAULT_STOP_LOSS_PCT = float(os.getenv("DEFAULT_STOP_LOSS_PCT", 0.10))
 
 # ===========================
 #  Indicator Parameters
