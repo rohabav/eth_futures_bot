@@ -80,16 +80,21 @@ class BinanceFuturesClient:
         return self._request("GET", "/fapi/v2/positionRisk", signed=True)
 
     def change_margin_type(self, symbol: str, margin_type: str = "ISOLATED") -> None:
-        try:
-            self._request(
-                "POST",
-                "/fapi/v1/marginType",
-                signed=True,
-                params={"symbol": symbol, "marginType": margin_type},
-            )
-        except Exception as e:
-            # If already that margin type, Binance returns error; we can ignore
-            print(f"[INFO] change_margin_type: {e}")
+    try:
+        self._request(
+            "POST",
+            "/fapi/v1/marginType",
+            signed=True,
+            params={"symbol": symbol, "marginType": margin_type},
+        )
+    except Exception as e:
+        msg = str(e)
+        if "No need to change margin type" in msg or '"code":-4046' in msg:
+            # This just means it's already the right type
+            print("[INFO] Margin type already set, skipping.")
+        else:
+            # If it's some other error, you might want to see it
+            print(f"[WARN] change_margin_type unexpected error: {e}")
 
     def change_leverage(self, symbol: str, leverage: int) -> None:
         self._request(
